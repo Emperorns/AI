@@ -1,7 +1,6 @@
 import os
 import asyncio
 import uvicorn
-from datetime import datetime, timedelta
 from fastapi import FastAPI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -9,110 +8,80 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import ai_engine
 import memory
 
-# 1. FastAPI Setup (Updated for Koyeb Health Checks)
 app = FastAPI()
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def health_check():
-    """Responds to both GET and HEAD requests to pass Koyeb health checks."""
-    return {"status": "online", "engine": "Gemini-2.0-Flash"}
-
-# 2. Telegram Bot Logic
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-user_cooldowns = {}
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Advanced Gemini Bot Online!\n\nCommands:\n/draw [prompt] - Generate images\n/reset - Clear memory\nOr just send me text, photos, or voice!")
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await memory.clear_history(update.effective_user.id)
-    await update.message.reply_text("🧠 Memory cleared!")
+    return {"status": "online"}
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    # Anti-Spam Cooldown (5 seconds)
-    now = datetime.now()
-    if user_id in user_cooldowns:
-        if now < user_cooldowns[user_id] + timedelta(seconds=5):
-            return # Ignore rapid messages to save quota
-    user_cooldowns[user_id] = now
-
-    user_text = update.message.text
-    if not user_text: return
-
-    # Let user know we are thinking
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
-    # Get history (limited to 5 messages to reduce token usage)
-    history = await memory.get_history(user_id, limit=5)
-    
-    # Get AI Response
-    response_text = await ai_engine.generate_response(user_id, user_text, history)
-    
-    # Save to MongoDB
-    await memory.save_message(user_id, "user", user_text)
-    await memory.save_message(user_id, "model", response_text)
-    
-    await update.message.reply_text(response_text)
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await update.message.reply_text("🎧 Listening to your voice message...")
-    
-    voice_file = await update.message.voice.get_file()
-    voice_bytes = await voice_file.download_as_bytearray()
-    
-    history = await memory.get_history(user_id, limit=3)
-    response = await ai_engine.generate_response(
-        user_id, 
-        "Transcribe and reply to this audio.", 
-        history,
-        image_data={"bytes": voice_bytes, "mime_type": "audio/ogg"}
-    )
-    await update.message.reply_text(response)
-
-async def draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = " ".join(context.args)
-    if not prompt:
-        await update.message.reply_text("Usage: /draw a futuristic city")
+    # Safety Check: Ignore updates without messages
+    if not update.message or not update.effective_user:
         return
-    
-    await update.message.reply_text("🎨 Generating image... please wait.")
-    image_bytes = await ai_engine.generate_image(prompt)
-    
-    if image_bytes:
-        await update.message.reply_photo(photo=image_bytes)
-    else:
-        await update.message.reply_text("❌ Sorry, image generation failed or quota reached.")
 
-# 3. Execution Bridge
+    user_id = update.effective_user.id
+    # Get text from message or caption (for photos)
+    user_text = update.message.text or update.message.caption or ""
+    
+    # If it's a photo without text, still allow it to process
+    if not user_text and not update.message.photo:
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    try:
+        # Get last 5 messages for context
+        history = await memory.get_history(user_id, limit=5)
+        
+        # Check for images
+        image_data = None
+        if update.message.photo:
+            photo = await update.message.photo[-1].get_file()
+            image_bytes = await photo.download_as_bytearray()
+            image_data = {'bytes': bytes(image_bytes), 'mime_type': 'image/jpeg'}
+
+        # Generate AI Response
+        response_text = await ai_engine.generate_response(user_id, user_text, history, image_data)
+        
+        # Save exchange to MongoDB
+        await memory.save_message(user_id, "user", user_text)
+        await memory.save_message(user_id, "model", response_text)
+        
+        await update.message.reply_text(response_text)
+        
+    except Exception as e:
+        print(f"Error in handle_message: {e}")
+        await update.message.reply_text("❌ Sorry, I encountered an error processing that.")
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await memory.clear_history(user_id)
+    await update.message.reply_text("🧹 Memory cleared! We're starting fresh.")
+
 async def run_bot():
+    TOKEN = os.getenv("TELEGRAM_TOKEN")
     application = Application.builder().token(TOKEN).build()
     
-    # Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("reset", reset))
-    application.add_handler(CommandHandler("draw", draw))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_message)) # Can expand this later
+    application.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Bot is online!")))
+    application.add_handler(CommandHandler("reset", reset_command))
+    application.add_handler(MessageHandler(filters.ALL, handle_message))
     
     await application.initialize()
     await application.start()
-    await application.updater.start_polling()
-    print("Telegram Bot is Polling...")
+    
+    # FIX: drop_pending_updates=True prevents the Conflict error on Koyeb
+    print("Starting polling...")
+    await application.updater.start_polling(drop_pending_updates=True)
 
 async def main():
     port = int(os.getenv("PORT", 8000))
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    config = uvicorn.Config(app, host="0.0.0.0", port=port)
     server = uvicorn.Server(config)
-    
-    # Run Web Server and Bot together
+    # Run FastAPI and Telegram Bot together
     await asyncio.gather(server.serve(), run_bot())
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        pass        
