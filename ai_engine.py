@@ -1,25 +1,18 @@
 import os
 import asyncio
 from google import genai
-from google.genai import types, errors
+from google.genai import types
 
-# 1. Setup API Key Rotation
-# Expects a comma-separated string in Koyeb: key1,key2,key3
-RAW_KEYS = os.getenv("GEMINI_KEYS", "")
+# 1. API KEY ROTATION SETUP
+# In Koyeb, set GEMINI_KEYS to a comma-separated list: key1,key2,key3
+RAW_KEYS = os.getenv("GEMINI_KEYS", os.getenv("GEMINI_API_KEY", ""))
 API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
 
-if not API_KEYS:
-    # Fallback to the single old variable if plural isn't found
-    SINGLE_KEY = os.getenv("GEMINI_API_KEY")
-    if SINGLE_KEY:
-        API_KEYS = [SINGLE_KEY]
-
-# Create a list of clients, one for each key
+# Initialize clients for all keys
 clients = [genai.Client(api_key=k) for k in API_KEYS]
 current_key_index = 0
 
 async def get_next_client():
-    """Cycles through available API keys to distribute load."""
     global current_key_index
     if not clients:
         return None
@@ -29,70 +22,84 @@ async def get_next_client():
 
 async def generate_response(user_id, prompt, history, image_data=None):
     """
-    Handles text/multimodal requests using key rotation and 
-    advanced error recovery.
+    Generates a response using key rotation, history trimming, 
+    and token optimization.
     """
-    config = types.GenerateContentConfig(
-        tools=[types.Tool(google_search=types.GoogleSearch())],
-        temperature=0.7
-    )
+    # 2. TOKEN OPTIMIZATION (THE MEMORY FIX)
+    # We strip out heavy media from old messages. 
+    # Only the current message should contain image data.
+    optimized_history = []
+    for msg in history:
+        # Extract only text parts from previous turns
+        text_parts = [p['text'] for p in msg.get('parts', []) if 'text' in p]
+        if text_parts:
+            optimized_history.append({
+                "role": msg["role"],
+                "parts": [{"text": " ".join(text_parts)}]
+            })
 
-    # Prepare parts
-    new_message_parts = [{"text": prompt}]
+    # 3. CONSTRUCT CURRENT MESSAGE
+    current_parts = [{"text": prompt}]
     if image_data:
-        new_message_parts.append(types.Part.from_bytes(
+        current_parts.append(types.Part.from_bytes(
             data=image_data['bytes'], 
             mime_type=image_data['mime_type']
         ))
-        
-    contents = history + [{"role": "user", "parts": new_message_parts}]
-
-    # --- RETRY & ROTATION LOGIC ---
-    max_retries = len(API_KEYS) * 2 if API_KEYS else 3
     
-    for attempt in range(max_retries):
+    optimized_history.append({"role": "user", "parts": current_parts})
+
+    # 4. RETRY & ROTATION LOGIC
+    # We try up to 3 different keys if we hit a rate limit
+    max_attempts = min(len(clients), 3) if clients else 1
+    
+    for attempt in range(max_attempts):
         client = await get_next_client()
         if not client:
-            return "❌ API Keys are missing. Please check environment variables."
+            return "❌ No API keys found in environment variables."
 
         try:
-            # Small delay to respect global Rate Limits
-            await asyncio.sleep(1) 
-            
+            # AI Configuration
+            config = types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.7,
+                system_instruction="You are a helpful AI assistant. Keep responses concise."
+            )
+
+            # Mandatory small delay to prevent rapid-fire hits on a single IP
+            await asyncio.sleep(1)
+
             response = client.models.generate_content(
                 model="gemini-2.0-flash",
-                contents=contents,
+                contents=optimized_history,
                 config=config
             )
             return response.text
-        
-        except Exception as e:
-            err_str = str(e).upper()
-            if "429" in err_str or "QUOTA" in err_str or "EXHAUSTED" in err_str:
-                print(f"Key {current_key_index} exhausted. Switching key...")
-                # Wait briefly and try the next key in the next loop iteration
-                await asyncio.sleep(2)
-                continue
-            else:
-                print(f"Gemini Error: {e}")
-                return f"❌ AI Error: {str(e)[:100]}..."
 
-    return "⚠️ All API keys are currently rate-limited. Please try again in 1 minute."
+        except Exception as e:
+            error_msg = str(e).upper()
+            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+                print(f"Key {current_key_index} rate limited. Retrying with next key...")
+                continue # Try next key
+            
+            print(f"Gemini API Error: {e}")
+            return f"⚠️ AI Error: {str(e)[:100]}..."
+
+    return "🚀 System overloaded. Please try again in 30 seconds or use /reset."
 
 async def generate_image(prompt):
-    """Generates an image using available keys."""
+    """Simple image generation fallback using the same key rotation."""
     client = await get_next_client()
     if not client: return None
 
     try:
+        # Note: Image generation might require specific model settings in 2026
         response = client.models.generate_content(
-            model="gemini-2.0-flash", 
+            model="gemini-2.0-flash",
             contents=[f"Generate an image of: {prompt}"],
             config=types.GenerateContentConfig(response_modalities=["IMAGE"])
         )
         for part in response.candidates[0].content.parts:
             if part.inline_data:
                 return part.inline_data.data
-    except Exception as e:
-        print(f"Image Gen Error: {e}")
-    return None
+    except Exception:
+        return None            
